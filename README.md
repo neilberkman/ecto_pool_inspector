@@ -49,7 +49,7 @@ config :ecto_pool_inspector,
       # Trigger conditions for automatic snapshots
       triggers: [
         {:pool_saturation, 0.8},  # Trigger at 80% pool usage
-        {:queue_time, :p95, 200, :millisecond}  # Trigger on high queue time
+        {:queue_time, 200}  # Trigger when any query waits >200ms for connection
       ],
 
       # Stack trace sampling configuration
@@ -206,7 +206,7 @@ capture_stack_traces: :sample,
 stack_trace_sample_rate: 0.1,
 triggers: [
   {:pool_saturation, 0.8},
-  {:queue_time, :p95, 200, :millisecond}
+  {:queue_time, 200}  # milliseconds
 ]
 ```
 
@@ -304,11 +304,30 @@ graph TB
 
 ## Known Limitations
 
-1. Only works with pools that emit DBConnection telemetry
-2. Requires at least one query to discover repo→pool mapping
-3. Small window where connections might be missed during capture
-4. Advanced DBConnection ownership transfer not tracked (rare edge case)
-5. Completely untested with real workloads
+### Pool Discovery
+
+Pool PIDs are discovered **lazily via telemetry events**. The first query to each repo will emit telemetry with `metadata.pool` which we use to register the pool.
+
+**This means monitoring does not start until after the first query runs.**
+
+If you need immediate monitoring on application startup, run a throwaway query:
+
+```elixir
+# In your Application.start/2, after repos are started
+Task.start(fn ->
+  MyApp.Repo.query("SELECT 1")
+end)
+```
+
+### Other Limitations
+
+1. **No direct pool PID access**: DBConnection doesn't expose pool PIDs directly. We rely on telemetry metadata.
+2. **Telemetry dependency**: Only works with pools that emit standard DBConnection telemetry events (`[:db_connection, :connection, :checkout]` and `[:db_connection, :connection, :checkin]`).
+3. **Race conditions**: Small window where connections might be checked in between snapshot collection and stack trace capture.
+4. **Ownership transfers**: Advanced DBConnection ownership transfers (allow/allowance) are not tracked. This is a rare edge case in production.
+5. **First-query requirement**: Cannot monitor pools that have never executed a query.
+6. **No p95/percentile tracking**: Queue time triggers fire on ANY query exceeding threshold, not on statistical aggregates. True percentile tracking would require significant memory overhead.
+7. **Completely untested**: No real-world production validation yet.
 
 ## License
 

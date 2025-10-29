@@ -1,17 +1,38 @@
 defmodule EctoPoolInspector.StateTracker do
   @moduledoc """
   Singleton GenServer maintaining real-time connection state for ALL pools on the node.
+
+  ## State Table Schema
+
+  The state table tracks checkouts using a composite key to handle multiple pools per process:
+
+      ETS Table: {{client_pid, pool_pid}, checked_out_at, monitor_ref, depth}
+
+  This allows a single process to hold connections from multiple pools simultaneously.
+
+  ## Depth Tracking
+
+  Depth tracks nested transactions on the same connection. When a process checks out
+  from the same pool multiple times, we increment depth rather than counting it as
+  multiple connections (DBConnection reuses the connection for nested transactions).
+
+  ## Pool Discovery
+
+  Pool PIDs are discovered lazily via telemetry `metadata.pool` from the first query.
+  There is no upfront discovery mechanism.
   """
 
   use GenServer
 
   defstruct [
-    # ETS table: {client_pid, pool_pid, checked_out_at, monitor_ref, depth}
+    # ETS table: {{client_pid, pool_pid}, checked_out_at, monitor_ref, depth}
     :state_table,
     # ETS table: {repo_atom, pool_pid}
     :mapping_table,
     # Optimized counters: %{pool_pid => count}
     :checkout_counts,
+    # Track which processes we're monitoring: %{client_pid => monitor_ref}
+    :monitors,
     # Config
     :cleanup_interval
   ]
@@ -64,6 +85,7 @@ defmodule EctoPoolInspector.StateTracker do
        checkout_counts: %{},
        cleanup_interval: cleanup_interval,
        mapping_table: mapping_table,
+       monitors: %{},
        state_table: state_table
      }}
   end
@@ -74,7 +96,7 @@ defmodule EctoPoolInspector.StateTracker do
   end
 
   def handle_checkin(_event, _measurements, metadata, tracker_pid) do
-    GenServer.cast(tracker_pid, {:checkin, metadata.pid})
+    GenServer.cast(tracker_pid, {:checkin, metadata.pid, metadata.pool})
   end
 
   @impl true
@@ -85,73 +107,80 @@ defmodule EctoPoolInspector.StateTracker do
 
   @impl true
   def handle_cast({:checkout, client_pid, pool_pid}, state) do
-    case :ets.lookup(state.state_table, client_pid) do
-      [] ->
-        # First checkout for this process
-        monitor_ref = Process.monitor(client_pid)
+    key = {client_pid, pool_pid}
 
-        :ets.insert(state.state_table, {
-          client_pid,
-          pool_pid,
-          System.monotonic_time(:millisecond),
-          monitor_ref,
-          # depth
-          1
-        })
+    {new_state, new_counts} =
+      case :ets.lookup(state.state_table, key) do
+        [] ->
+          # First checkout for this process + pool combination
+          monitor_ref = ensure_monitored(client_pid, state.monitors)
 
-        # Update counter cache
-        new_counts = Map.update(state.checkout_counts, pool_pid, 1, &(&1 + 1))
-        {:noreply, %{state | checkout_counts: new_counts}}
+          :ets.insert(state.state_table, {
+            key,
+            System.monotonic_time(:millisecond),
+            monitor_ref,
+            1
+          })
 
-      [{^client_pid, pool_pid, checked_out_at, monitor_ref, depth}] ->
-        # Nested transaction - update depth
-        :ets.insert(
-          state.state_table,
-          {client_pid, pool_pid, checked_out_at, monitor_ref, depth + 1}
-        )
+          # Update counter cache
+          new_counts = Map.update(state.checkout_counts, pool_pid, 1, &(&1 + 1))
+          monitors = Map.put(state.monitors, client_pid, monitor_ref)
+          {%{state | monitors: monitors}, new_counts}
 
-        {:noreply, state}
-    end
+        [{^key, checked_out_at, monitor_ref, depth}] ->
+          # Nested transaction - update depth, don't increment counter
+          :ets.insert(state.state_table, {key, checked_out_at, monitor_ref, depth + 1})
+          {state, state.checkout_counts}
+      end
+
+    {:noreply, %{new_state | checkout_counts: new_counts}}
   end
 
   @impl true
-  def handle_cast({:checkin, client_pid}, state) do
-    case :ets.lookup(state.state_table, client_pid) do
-      [{^client_pid, pool_pid, _checked_out_at, monitor_ref, depth}] ->
-        if depth > 1 do
+  def handle_cast({:checkin, client_pid, pool_pid}, state) do
+    key = {client_pid, pool_pid}
+
+    new_counts =
+      case :ets.lookup(state.state_table, key) do
+        [{^key, _checked_out_at, _monitor_ref, depth}] when depth > 1 ->
           # Still in nested transaction - just decrement depth
-          :ets.update_element(state.state_table, client_pid, {5, depth - 1})
-          {:noreply, state}
-        else
+          :ets.update_element(state.state_table, key, {4, depth - 1})
+          state.checkout_counts
+
+        [{^key, _checked_out_at, _monitor_ref, _depth}] ->
           # Final checkin
-          Process.demonitor(monitor_ref, [:flush])
-          :ets.delete(state.state_table, client_pid)
+          :ets.delete(state.state_table, key)
+
+          # Check if process has any other checkouts
+          cleanup_monitor_if_done(client_pid, state)
 
           # Update counter cache
-          new_counts = Map.update(state.checkout_counts, pool_pid, 0, &max(&1 - 1, 0))
-          {:noreply, %{state | checkout_counts: new_counts}}
-        end
+          Map.update(state.checkout_counts, pool_pid, 0, &max(&1 - 1, 0))
 
-      [] ->
-        # Already cleaned up or not tracked
-        {:noreply, state}
-    end
+        [] ->
+          # Already cleaned up or not tracked
+          state.checkout_counts
+      end
+
+    {:noreply, %{state | checkout_counts: new_counts}}
   end
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    # Process died while holding connection
-    case :ets.lookup(state.state_table, pid) do
-      [{^pid, pool_pid, _checked_out_at, _monitor_ref, _depth}] ->
-        :ets.delete(state.state_table, pid)
+    # Process died while holding connection(s)
+    # Find all checkouts for this process across all pools
+    pattern = {{pid, :_}, :_, :_, :_}
+    entries = :ets.match_object(state.state_table, pattern)
 
-        # Update counter cache
-        new_counts = Map.update(state.checkout_counts, pool_pid, 0, &max(&1 - 1, 0))
-        {:noreply, %{state | checkout_counts: new_counts}}
+    new_counts =
+      Enum.reduce(entries, state.checkout_counts, fn {{^pid, pool_pid}, _, _, _}, counts ->
+        :ets.delete(state.state_table, {pid, pool_pid})
+        Map.update(counts, pool_pid, 0, &max(&1 - 1, 0))
+      end)
 
-      [] ->
-        {:noreply, state}
-    end
+    monitors = Map.delete(state.monitors, pid)
+
+    {:noreply, %{state | checkout_counts: new_counts, monitors: monitors}}
   end
 
   @impl true
@@ -159,23 +188,28 @@ defmodule EctoPoolInspector.StateTracker do
     # Fallback cleanup for any missed :DOWN messages
     all_entries = :ets.tab2list(state.state_table)
 
-    {dead_entries, new_counts} =
-      Enum.reduce(all_entries, {[], state.checkout_counts}, fn
-        {pid, pool_pid, _, _, _} = _entry, {dead_acc, counts_acc} ->
+    {dead_pids, new_counts} =
+      Enum.reduce(all_entries, {MapSet.new(), state.checkout_counts}, fn
+        {{pid, pool_pid}, _, _, _}, {dead_acc, counts_acc} ->
           if Process.alive?(pid) do
             {dead_acc, counts_acc}
           else
-            # Clean up dead process and update counter
             updated_counts = Map.update(counts_acc, pool_pid, 0, &max(&1 - 1, 0))
-            {[pid | dead_acc], updated_counts}
+            {MapSet.put(dead_acc, pid), updated_counts}
           end
       end)
 
-    # Delete all dead entries
-    Enum.each(dead_entries, &:ets.delete(state.state_table, &1))
+    # Delete all entries for dead processes
+    Enum.each(dead_pids, fn pid ->
+      pattern = {{pid, :_}, :_, :_, :_}
+      :ets.match_delete(state.state_table, pattern)
+    end)
+
+    # Clean up monitor tracking
+    monitors = Map.drop(state.monitors, MapSet.to_list(dead_pids))
 
     Process.send_after(self(), :cleanup_dead_entries, state.cleanup_interval)
-    {:noreply, %{state | checkout_counts: new_counts}}
+    {:noreply, %{state | checkout_counts: new_counts, monitors: monitors}}
   end
 
   @impl true
@@ -191,26 +225,16 @@ defmodule EctoPoolInspector.StateTracker do
 
   @impl true
   def handle_call({:get_checkout_count, pool_pid}, _from, state) do
-    # Use counter cache for O(1) performance
     count = Map.get(state.checkout_counts, pool_pid, 0)
     {:reply, count, state}
   end
 
   @impl true
   def handle_call({:capture_snapshot, pool_pid, config}, _from, state) do
-    # Get all connections for this pool - simple filter since we use tuples now
-    all_entries = :ets.tab2list(state.state_table)
+    pattern = {{:_, pool_pid}, :_, :_, :_}
+    connections = :ets.match_object(state.state_table, pattern)
 
-    connections =
-      Enum.filter(all_entries, fn
-        {_pid, ^pool_pid, _checked_out_at, _monitor_ref, _depth} -> true
-        _ -> false
-      end)
-
-    # Apply sampling configuration
     sampled_connections = sample_connections(connections, config)
-
-    # Capture stack traces (using async for performance)
     snapshot_entries = capture_stack_traces(sampled_connections, config)
 
     snapshot = %{
@@ -227,6 +251,30 @@ defmodule EctoPoolInspector.StateTracker do
   end
 
   # Private helpers
+
+  defp ensure_monitored(pid, monitors) do
+    case Map.get(monitors, pid) do
+      nil -> Process.monitor(pid)
+      ref -> ref
+    end
+  end
+
+  defp cleanup_monitor_if_done(pid, state) do
+    pattern = {{pid, :_}, :_, :_, :_}
+
+    case :ets.match(state.state_table, pattern, 1) do
+      :"$end_of_table" ->
+        case Map.get(state.monitors, pid) do
+          nil -> :ok
+          ref -> Process.demonitor(ref, [:flush])
+        end
+
+        %{state | monitors: Map.delete(state.monitors, pid)}
+
+      _ ->
+        state
+    end
+  end
 
   defp sample_connections(connections, config) do
     case config[:capture_stack_traces] do
@@ -248,7 +296,7 @@ defmodule EctoPoolInspector.StateTracker do
 
     connections
     |> Task.async_stream(
-      fn {pid, pool_pid, checked_out_at, _monitor_ref, depth} ->
+      fn {{pid, pool_pid}, checked_out_at, _monitor_ref, depth} ->
         case EctoPoolInspector.StackTrace.capture(pid) do
           {:ok, stack_info} ->
             %{

@@ -1,6 +1,16 @@
 defmodule EctoPoolInspector.RepoMonitor do
   @moduledoc """
   Per-repo trigger evaluation with rate limiting.
+
+  ## Pool Discovery
+
+  The pool PID is discovered lazily via telemetry events. The first query to the repo
+  will emit telemetry with `metadata.pool` which we use to register the pool.
+
+  ## Important
+
+  This means monitoring does not start until after the first query runs. Applications
+  should run a throwaway query on startup if they want immediate monitoring.
   """
 
   use GenServer
@@ -20,29 +30,14 @@ defmodule EctoPoolInspector.RepoMonitor do
 
   @impl true
   def init({repo, config}) do
-    # Get pool size from repo config or use configured default
-    pool_size = config[:pool_size] || 10
+    # Get pool size from repo config, fall back to inspector config
+    pool_size = get_pool_size(repo, config)
 
-    # Discover and register the pool with StateTracker
-    pool_pid = discover_pool_pid(repo)
-
-    if pool_pid do
-      GenServer.cast(EctoPoolInspector.StateTracker, {:discover_pool, repo, pool_pid})
-    end
+    # Pool PID is discovered lazily via telemetry - see handle_query_event
+    # No upfront discovery mechanism exists
 
     # Attach to repo query events
-    app_name = config[:app_name]
-
-    if app_name do
-      event_name = [app_name, :repo, :query]
-
-      :telemetry.attach(
-        "ecto-pool-inspector-monitor-#{repo}-#{node()}",
-        event_name,
-        &handle_query_event/4,
-        {self(), config}
-      )
-    end
+    attach_telemetry(repo, config)
 
     # Schedule saturation check
     poll_interval = config[:saturation_poll_interval] || 10_000
@@ -53,55 +48,38 @@ defmodule EctoPoolInspector.RepoMonitor do
        config: config,
        last_snapshot_at: nil,
        poll_interval: poll_interval,
-       pool_pid: pool_pid,
+       pool_pid: nil,
        pool_size: pool_size,
        repo: repo
      }}
   end
 
-  # Helper to discover the pool PID from the repo's supervision tree
-  defp discover_pool_pid(repo) do
-    # Try to get the repo's pool from its config
-    case Process.whereis(repo) do
-      nil -> nil
-      repo_pid -> repo_pid
-    end
-  end
-
   # Telemetry handler (fast path)
-  def handle_query_event(_event, measurements, _metadata, {monitor_pid, config}) do
-    # Check queue time trigger
-    queue_time = measurements[:queue_time] || measurements[:idle_time]
+  def handle_query_event(_event, measurements, metadata, {monitor_pid, config}) do
+    # Discover pool PID from first query (if not already discovered)
+    if metadata[:pool] do
+      GenServer.cast(monitor_pid, {:discover_pool, metadata.pool})
+    end
 
-    if queue_time && should_trigger_queue_time?(queue_time, config[:triggers] || []) do
-      GenServer.cast(monitor_pid, {:trigger_snapshot, :queue_time_exceeded})
+    # Check queue time trigger (NOT idle time - that's different)
+    if measurements[:queue_time] do
+      threshold_ns = get_queue_time_threshold_ns(config[:triggers] || [])
+
+      if threshold_ns && measurements.queue_time > threshold_ns do
+        GenServer.cast(monitor_pid, {:trigger_snapshot, :queue_time_exceeded})
+      end
     end
   end
 
   @impl true
-  def handle_info(:check_pool_saturation, state) do
-    # Check saturation trigger
-    pool_pid = state.pool_pid || get_pool_pid_from_tracker(state.repo)
-
-    if pool_pid do
-      count = GenServer.call(EctoPoolInspector.StateTracker, {:get_checkout_count, pool_pid})
-
-      # Avoid divide by zero
-      saturation =
-        if state.pool_size > 0 do
-          count / state.pool_size
-        else
-          0.0
-        end
-
-      if should_trigger_saturation?(saturation, state.config[:triggers] || []) do
-        GenServer.cast(self(), {:trigger_snapshot, :pool_saturation})
-      end
+  def handle_cast({:discover_pool, pool_pid}, state) do
+    if state.pool_pid == nil do
+      # First time seeing this pool, register it
+      GenServer.cast(EctoPoolInspector.StateTracker, {:discover_pool, state.repo, pool_pid})
+      {:noreply, %{state | pool_pid: pool_pid}}
+    else
+      {:noreply, state}
     end
-
-    # Schedule next check
-    Process.send_after(self(), :check_pool_saturation, state.poll_interval)
-    {:noreply, state}
   end
 
   @impl true
@@ -115,7 +93,62 @@ defmodule EctoPoolInspector.RepoMonitor do
     end
   end
 
+  @impl true
+  def handle_info(:check_pool_saturation, state) do
+    if state.pool_pid do
+      count = GenServer.call(EctoPoolInspector.StateTracker, {:get_checkout_count, state.pool_pid})
+      saturation = calculate_saturation(count, state.pool_size)
+
+      if should_trigger_saturation?(saturation, state.config[:triggers] || []) do
+        GenServer.cast(self(), {:trigger_snapshot, :pool_saturation})
+      end
+    end
+
+    Process.send_after(self(), :check_pool_saturation, state.poll_interval)
+    {:noreply, state}
+  end
+
   # Private helpers
+
+  defp get_pool_size(repo, config) do
+    # Try repo config first (canonical source), fall back to inspector config
+    case repo.config()[:pool_size] do
+      nil -> config[:pool_size] || 10
+      size when is_integer(size) -> size
+      _ -> 10
+    end
+  end
+
+  defp attach_telemetry(repo, config) do
+    app_name = config[:app_name]
+
+    if app_name do
+      event_name = [app_name, :repo, :query]
+
+      :telemetry.attach(
+        "ecto-pool-inspector-monitor-#{repo}-#{node()}",
+        event_name,
+        &__MODULE__.handle_query_event/4,
+        {self(), config}
+      )
+    end
+  end
+
+  defp get_queue_time_threshold_ns(triggers) do
+    Enum.find_value(triggers, fn
+      {:queue_time, threshold_ms} when is_integer(threshold_ms) ->
+        System.convert_time_unit(threshold_ms, :millisecond, :native)
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp calculate_saturation(count, pool_size) when pool_size > 0 do
+    min(count / pool_size, 1.0)
+  end
+
+  defp calculate_saturation(_count, _pool_size), do: 0.0
 
   defp should_capture_snapshot?(state, now) do
     min_interval = state.config[:snapshot_interval] || 60_000
@@ -127,7 +160,7 @@ defmodule EctoPoolInspector.RepoMonitor do
   end
 
   defp capture_and_store_snapshot(state, reason, now) do
-    pool_pid = state.pool_pid || get_pool_pid_from_tracker(state.repo)
+    pool_pid = state.pool_pid
 
     case capture_snapshot_from_pool(pool_pid, state) do
       {:ok, snapshot} ->
@@ -164,24 +197,6 @@ defmodule EctoPoolInspector.RepoMonitor do
       %{connection_count: length(snapshot.connections)},
       %{reason: reason, repo: state.repo}
     )
-  end
-
-  defp get_pool_pid_from_tracker(repo) do
-    case GenServer.call(EctoPoolInspector.StateTracker, {:get_pool_pid, repo}) do
-      {:ok, pool_pid} -> pool_pid
-      {:error, :pool_not_discovered} -> nil
-    end
-  end
-
-  defp should_trigger_queue_time?(queue_time_ns, triggers) do
-    Enum.any?(triggers, fn
-      {:queue_time, :p95, threshold_ms, :millisecond} ->
-        queue_time_ms = System.convert_time_unit(queue_time_ns, :native, :millisecond)
-        queue_time_ms > threshold_ms
-
-      _ ->
-        false
-    end)
   end
 
   defp should_trigger_saturation?(saturation, triggers) do

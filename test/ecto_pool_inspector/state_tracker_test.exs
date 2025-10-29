@@ -22,7 +22,7 @@ defmodule EctoPoolInspector.StateTrackerTest do
       assert count == 1
 
       # Simulate checkin
-      GenServer.cast(tracker, {:checkin, client_pid})
+      GenServer.cast(tracker, {:checkin, client_pid, pool_pid})
       Process.sleep(50)
 
       # Verify count decreased
@@ -53,7 +53,7 @@ defmodule EctoPoolInspector.StateTrackerTest do
       assert count2 == 1
 
       # First checkin (depth 2 -> 1)
-      GenServer.cast(tracker, {:checkin, client_pid})
+      GenServer.cast(tracker, {:checkin, client_pid, pool_pid})
       Process.sleep(50)
 
       # Should still be checked out
@@ -61,7 +61,7 @@ defmodule EctoPoolInspector.StateTrackerTest do
       assert count3 == 1
 
       # Final checkin (depth 1 -> 0)
-      GenServer.cast(tracker, {:checkin, client_pid})
+      GenServer.cast(tracker, {:checkin, client_pid, pool_pid})
       Process.sleep(50)
 
       # Now should be 0

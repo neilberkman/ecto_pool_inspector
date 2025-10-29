@@ -13,11 +13,9 @@ defmodule EctoPoolInspector.Storage.ETS do
 
   @impl true
   def init({repo, config}) do
-    # Create unique ETS table
     table_name = :"ecto_pool_inspector_storage_#{inspect(repo)}_#{node()}"
     table = :ets.new(table_name, [:ordered_set, :public])
 
-    # Register with Registry
     Registry.register(EctoPoolInspector.Registry, {repo, :storage}, self())
 
     {:ok,
@@ -30,18 +28,10 @@ defmodule EctoPoolInspector.Storage.ETS do
 
   @impl true
   def handle_cast({:store, snapshot}, state) do
-    # Use timestamp as key for ordering
-    key = {DateTime.to_unix(snapshot.timestamp, :microsecond), :rand.uniform()}
+    # Use microsecond timestamp + random integer (1..1M) to avoid collisions
+    key = {DateTime.to_unix(snapshot.timestamp, :microsecond), :rand.uniform(1_000_000)}
     :ets.insert(state.table, {key, snapshot})
-
-    # Enforce circular buffer
-    size = :ets.info(state.table, :size)
-
-    if size > state.max_snapshots do
-      oldest_key = :ets.first(state.table)
-      :ets.delete(state.table, oldest_key)
-    end
-
+    enforce_circular_buffer(state)
     {:noreply, state}
   end
 
@@ -66,7 +56,6 @@ defmodule EctoPoolInspector.Storage.ETS do
   def handle_call({:list, opts}, _from, state) do
     limit = opts[:limit] || 10
 
-    # Get most recent snapshots
     snapshots =
       :ets.tab2list(state.table)
       |> Enum.sort_by(&elem(&1, 0), :desc)
@@ -79,36 +68,57 @@ defmodule EctoPoolInspector.Storage.ETS do
   @impl true
   def handle_call({:capture, reason}, _from, state) do
     with {:ok, pool_pid} <- get_pool_pid(state.repo),
-         config = Application.get_env(:ecto_pool_inspector, state.repo, []),
+         config = get_config(state.repo),
          {:ok, snapshot} <- capture_snapshot(pool_pid, config) do
       snapshot_with_reason = Map.put(snapshot, :reason, reason)
-      store_snapshot(state, snapshot_with_reason)
+      store_snapshot_direct(state, snapshot_with_reason)
       {:reply, {:ok, snapshot_with_reason}, state}
     else
       error -> {:reply, error, state}
     end
   end
 
+  # Private helpers
+
   defp get_pool_pid(repo) do
-    GenServer.call(EctoPoolInspector.StateTracker, {:get_pool_pid, repo})
+    GenServer.call(EctoPoolInspector.StateTracker, {:get_pool_pid, repo}, 5_000)
+  end
+
+  defp get_config(repo) do
+    Application.get_env(:ecto_pool_inspector, repo, [])
   end
 
   defp capture_snapshot(pool_pid, config) do
-    GenServer.call(EctoPoolInspector.StateTracker, {:capture_snapshot, pool_pid, config}, 10_000)
+    GenServer.call(EctoPoolInspector.StateTracker, {:capture_snapshot, pool_pid, config}, 15_000)
   end
 
-  defp store_snapshot(state, snapshot) do
-    key = {DateTime.to_unix(snapshot.timestamp, :microsecond), :rand.uniform()}
+  defp store_snapshot_direct(state, snapshot) do
+    key = {DateTime.to_unix(snapshot.timestamp, :microsecond), :rand.uniform(1_000_000)}
     :ets.insert(state.table, {key, snapshot})
     enforce_circular_buffer(state)
   end
 
   defp enforce_circular_buffer(state) do
     size = :ets.info(state.table, :size)
+    excess = size - state.max_snapshots
 
-    if size > state.max_snapshots do
-      oldest_key = :ets.first(state.table)
-      :ets.delete(state.table, oldest_key)
+    if excess > 0 do
+      # Delete multiple entries if we're over the limit
+      # This handles concurrent inserts better
+      delete_oldest_n(state.table, excess)
+    end
+  end
+
+  defp delete_oldest_n(_table, 0), do: :ok
+
+  defp delete_oldest_n(table, n) when n > 0 do
+    case :ets.first(table) do
+      :"$end_of_table" ->
+        :ok
+
+      key ->
+        :ets.delete(table, key)
+        delete_oldest_n(table, n - 1)
     end
   end
 end
