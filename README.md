@@ -1,333 +1,73 @@
 # EctoPoolInspector
 
-## WARNING: EXPERIMENTAL - DO NOT USE IN PRODUCTION
+Production-ready Ecto connection pool monitoring with cluster-aware snapshots.
 
-This library is completely untested in real-world scenarios and may contain bugs that could impact your database connections. Use at your own risk. Not recommended for production use.
+**WARNING: EXPERIMENTAL - DO NOT USE IN PRODUCTION**
 
-## Overview
+This library is completely untested in real-world scenarios and may contain bugs that could impact your database connections.
 
-EctoPoolInspector provides real-time visibility into Ecto connection pool usage in production Elixir applications. When database connection pools become exhausted, this library captures point-in-time snapshots showing which processes hold connections, their stack traces, hold durations, and application context.
+## Project Structure
 
-The library is cluster-aware, providing aggregated views across all nodes.
+This is an umbrella project containing:
 
-## Features
+- **apps/ecto_pool_inspector/** - The library itself
+- **apps/inspector_test_harness/** - Phoenix app for E2E testing
 
-- Real-time connection tracking via DBConnection telemetry
-- Automatic snapshot capture based on configurable triggers (pool saturation, queue time)
-- Configurable stack trace sampling
-- Cluster-aware snapshot aggregation
-- Context detection for Phoenix requests, Oban jobs, Broadway processors, GenServer calls, and Tasks
+## Why Umbrella?
+
+The E2E test harness validates the library works in realistic, production-like scenarios:
+
+- Pool exhaustion with concurrent connections
+- Stack trace capture under load
+- Cluster-wide snapshot aggregation
+- Process monitoring and leak detection
 - Nested transaction depth tracking
-- Rate limiting and configurable sampling
 
-## Installation
+Unit tests prove components work in isolation. E2E tests prove the system solves the actual problem.
 
-Add `ecto_pool_inspector` to your list of dependencies in `mix.exs`:
+## Development
 
-```elixir
-def deps do
-  [
-    {:ecto_pool_inspector, "~> 0.1.0"}
-  ]
-end
+```bash
+# Fetch dependencies
+mix deps.get
+
+# Run unit tests for the library
+mix test apps/ecto_pool_inspector/test
+
+# Run E2E tests (requires PostgreSQL)
+cd apps/inspector_test_harness
+MIX_ENV=test mix ecto.setup
+MIX_ENV=test mix test test/e2e/
+
+# Run all tests
+mix test.all
 ```
 
-## Configuration
+## E2E Test Scenarios
 
-Configure in your `config/config.exs` or `config/runtime.exs`:
+### Scenario 1: Pool Saturation
+Tests automatic snapshot capture when pool reaches 80% capacity. Validates stack traces, connection tracking, and depth handling.
 
-```elixir
-config :ecto_pool_inspector,
-  repos: [
-    %{
-      # The Ecto repo to monitor
-      repo: MyApp.Repo,
+### Scenario 4: Cluster-Wide RPC
+Tests multi-node snapshot aggregation via RPC. Validates the `:all` and specific node targeting APIs.
 
-      # Application name for telemetry events (required)
-      app_name: :my_app,
+### Multi-Pool Composite Key
+Tests that a single process can hold connections from multiple pools simultaneously (validates the `{{client_pid, pool_pid}, ...}` schema fix).
 
-      # Trigger conditions for automatic snapshots
-      triggers: [
-        {:pool_saturation, 0.8},  # Trigger at 80% pool usage
-        {:queue_time, 200}  # Trigger when any query waits >200ms for connection
-      ],
+## Known Issues
 
-      # Stack trace sampling configuration
-      capture_stack_traces: :sample,  # :all | :none | :sample
-      stack_trace_sample_rate: 0.1,   # Sample 10% when :sample mode
-      stack_trace_timeout: 100,        # ms per stack capture
-      stack_trace_concurrency: 10,     # Max concurrent captures
+### Ecto.Adapters.SQL.Sandbox Compatibility
 
-      # Snapshot storage configuration
-      max_snapshots: 50,  # Keep last 50 snapshots per node
+Currently, E2E tests fail with `:pool_not_discovered` because `Ecto.Adapters.SQL.Sandbox` wraps the pool and changes telemetry behavior. The inspector listens for `:db_connection` telemetry events which aren't emitted the same way in Sandbox mode.
 
-      # Monitoring intervals
-      saturation_poll_interval: 10_000,  # Check saturation every 10s
-      snapshot_interval: 60_000,         # Min time between auto snapshots
+**Solutions being explored:**
+1. Use a real pool (non-Sandbox) for E2E tests
+2. Add Sandbox-specific telemetry handlers
+3. Manual pool PID injection for tests
 
-      # Pool configuration (if not in repo config)
-      pool_size: 10
-    }
-  ]
-```
+## Library Documentation
 
-### Multiple Repos
-
-You can monitor multiple repos by adding multiple configurations:
-
-```elixir
-config :ecto_pool_inspector,
-  repos: [
-    %{
-      repo: MyApp.Repo,
-      app_name: :my_app,
-      triggers: [{:pool_saturation, 0.8}],
-      capture_stack_traces: :sample,
-      pool_size: 10
-    },
-    %{
-      repo: MyApp.ReadReplica,
-      app_name: :my_app,
-      triggers: [{:pool_saturation, 0.9}],  # Higher threshold for read replica
-      capture_stack_traces: :none,  # No stack traces for read replica
-      pool_size: 20
-    }
-  ]
-```
-
-## Setup
-
-Add to your application supervision tree:
-
-```elixir
-defmodule MyApp.Application do
-  use Application
-
-  def start(_type, _args) do
-    children = [
-      MyApp.Repo,
-      {EctoPoolInspector, []},  # Must come AFTER repos
-      # ... other children
-    ]
-
-    Supervisor.start_link(children, strategy: :one_for_one)
-  end
-end
-```
-
-## Usage
-
-### Manual Snapshot Capture
-
-```elixir
-# Capture snapshot on all nodes
-EctoPoolInspector.capture_snapshot(MyApp.Repo, :all, :manual_debug)
-
-# Capture on local node only (faster)
-EctoPoolInspector.capture_snapshot(MyApp.Repo, :local, :investigating_issue)
-
-# Capture on specific nodes
-nodes = [:"app@prod-1", :"app@prod-2"]
-EctoPoolInspector.capture_snapshot(MyApp.Repo, nodes, :targeted_debug)
-```
-
-### Viewing Snapshots
-
-```elixir
-# Get latest snapshot from all nodes
-EctoPoolInspector.latest_snapshot(MyApp.Repo, :all)
-|> EctoPoolInspector.format_snapshot()
-
-# List recent snapshots
-EctoPoolInspector.list_snapshots(MyApp.Repo, :all, limit: 5)
-```
-
-### Example Output
-
-```
-Snapshot at 2025-10-29 03:45:00.123456Z
-Node: prod@app-1
-Reason: pool_saturation
-Pool Size: 10
-Total Connections: 8
-Sampled Connections: 2
-
-Connection Details:
-
-PID: #PID<0.1234.0>
-Held For: 5234ms
-Depth: 1
-Context: Phoenix Request
-Initial Call: {:cowboy_stream_h, :request_process, 3}
-
-Stack Trace:
-lib/my_app/slow_query.ex:45: MyApp.SlowQuery.fetch_data/1
-lib/my_app_web/controllers/reports_controller.ex:23: MyApp.ReportsController.index/2
-...
-```
-
-## Deployment Strategy (If You Ignore The Warning Above)
-
-### Phase 1: Passive Monitoring
-
-Start with minimal overhead:
-
-```elixir
-config :ecto_pool_inspector,
-  repos: [
-    %{
-      repo: MyApp.Repo,
-      app_name: :my_app,
-      capture_stack_traces: :none,  # Just counts
-      saturation_poll_interval: 30_000,  # Low frequency
-      triggers: [
-        {:pool_saturation, 0.95}  # High threshold
-      ]
-    }
-  ]
-```
-
-### Phase 2: Selective Stack Traces
-
-After validating Phase 1:
-
-```elixir
-capture_stack_traces: :sample,
-stack_trace_sample_rate: 0.05,  # 5% sampling
-triggers: [
-  {:pool_saturation, 0.85}  # Lower threshold
-]
-```
-
-### Phase 3: Full Production
-
-```elixir
-capture_stack_traces: :sample,
-stack_trace_sample_rate: 0.1,
-triggers: [
-  {:pool_saturation, 0.8},
-  {:queue_time, 200}  # milliseconds
-]
-```
-
-## Testing
-
-### Simulating Pool Exhaustion
-
-The library includes test helpers for simulating pool exhaustion:
-
-```elixir
-defmodule MyApp.PoolTest do
-  use ExUnit.Case
-
-  alias EctoPoolInspector.TestHelper
-
-  test "captures snapshot when pool is exhausted" do
-    # Exhaust the pool
-    tasks = TestHelper.exhaust_pool(MyApp.Repo, 8)
-
-    # Capture snapshot
-    {:ok, snapshot} = EctoPoolInspector.capture_snapshot(MyApp.Repo, :local, :test)
-
-    # Verify snapshot shows connections
-    assert snapshot.total_connections == 8
-
-    # Clean up
-    TestHelper.cleanup_tasks(tasks)
-  end
-end
-```
-
-### Alternative Testing Approach
-
-```elixir
-# Using transactions instead of direct checkout
-tasks = TestHelper.exhaust_pool_with_transactions(MyApp.Repo, 8)
-# ... perform tests ...
-TestHelper.cleanup_tasks(tasks)
-```
-
-## Monitoring the Monitor
-
-Subscribe to telemetry events to monitor the inspector itself:
-
-```elixir
-:telemetry.attach(
-  "log-inspector-events",
-  [:ecto_pool_inspector, :snapshot, :captured],
-  fn _event, measurements, metadata, _config ->
-    Logger.info("""
-    Pool snapshot captured
-    Repo: #{inspect(metadata.repo)}
-    Reason: #{metadata.reason}
-    Connections: #{measurements.connection_count}
-    """)
-  end,
-  nil
-)
-```
-
-## Architecture
-
-```mermaid
-graph TB
-    subgraph "Per Node"
-        ST[StateTracker Singleton<br/>- Monitors DBConnection events<br/>- Tracks checkout state<br/>- Process monitoring]
-
-        ST --> RM1[RepoMonitor 1<br/>MyRepo]
-        ST --> RM2[RepoMonitor 2<br/>ReadRepo]
-        ST --> RMN[RepoMonitor N<br/>...]
-
-        RM1 --> S1[Storage.ETS 1]
-        RM2 --> S2[Storage.ETS 2]
-        RMN --> SN[Storage.ETS N]
-    end
-
-    S1 --> API[Public API RPC<br/>Aggregates across nodes]
-    S2 --> API
-    SN --> API
-```
-
-## Design Principles
-
-1. Built on DBConnection telemetry events
-2. Cluster-aware snapshot aggregation
-3. Rate limiting and configurable sampling to minimize overhead
-
-## Performance Characteristics
-
-- StateTracker Memory: O(n) where n = active connections
-- Checkout/Checkin: O(1) with counter cache
-- Pool Saturation Check: O(1) with counter cache
-- Snapshot Capture: O(m) where m = sampled connections
-- Telemetry Overhead: Async cast per query
-
-## Known Limitations
-
-### Pool Discovery
-
-Pool PIDs are discovered **lazily via telemetry events**. The first query to each repo will emit telemetry with `metadata.pool` which we use to register the pool.
-
-**This means monitoring does not start until after the first query runs.**
-
-If you need immediate monitoring on application startup, run a throwaway query:
-
-```elixir
-# In your Application.start/2, after repos are started
-Task.start(fn ->
-  MyApp.Repo.query("SELECT 1")
-end)
-```
-
-### Other Limitations
-
-1. **No direct pool PID access**: DBConnection doesn't expose pool PIDs directly. We rely on telemetry metadata.
-2. **Telemetry dependency**: Only works with pools that emit standard DBConnection telemetry events (`[:db_connection, :connection, :checkout]` and `[:db_connection, :connection, :checkin]`).
-3. **Race conditions**: Small window where connections might be checked in between snapshot collection and stack trace capture.
-4. **Ownership transfers**: Advanced DBConnection ownership transfers (allow/allowance) are not tracked. This is a rare edge case in production.
-5. **First-query requirement**: Cannot monitor pools that have never executed a query.
-6. **No p95/percentile tracking**: Queue time triggers fire on ANY query exceeding threshold, not on statistical aggregates. True percentile tracking would require significant memory overhead.
-7. **Completely untested**: No real-world production validation yet.
+See [apps/ecto_pool_inspector/README.md](apps/ecto_pool_inspector/README.md) for full library documentation, configuration, and usage examples.
 
 ## License
 
